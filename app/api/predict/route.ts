@@ -30,21 +30,74 @@ function normalizeLabel(rawLabel: string): string {
   return String(rawLabel).toUpperCase();
 }
 
-async function queryEndpoint(url: string, body: any, headers: Record<string, string>) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 60000);
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    return response;
-  } finally {
-    clearTimeout(timeoutId);
+/**
+ * Normalizes Space URL:
+ * e.g. "https://huggingface.co/spaces/HimuX/pubmed-rct-api" -> "https://himux-pubmed-rct-api.hf.space"
+ */
+function normalizeSpaceUrl(rawUrl: string): string {
+  let url = rawUrl.trim();
+  if (url.includes('huggingface.co/spaces/')) {
+    const parts = url.split('huggingface.co/spaces/')[1].split('/');
+    if (parts.length >= 2) {
+      const user = parts[0].toLowerCase();
+      const space = parts[1].toLowerCase().replace(/\/$/, '');
+      url = `https://${user}-${space}.hf.space`;
+    }
   }
+  return url.replace(/\/+$/, '');
+}
+
+async function callGradioApi(baseUrl: string, textPayload: string, headers: Record<string, string>) {
+  // Gradio 4+ uses /call/predict (with event id) or /run/predict or /api/predict
+  const endpoints = [
+    `${baseUrl}/run/predict`,
+    `${baseUrl}/api/predict`,
+    `${baseUrl}/gradio_api/call/predict`,
+    `${baseUrl}/call/predict`,
+    `${baseUrl}/predict`,
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20000);
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ data: [textPayload], sentences: textPayload.split('\n') }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const json = await res.json();
+        // If Gradio /call/predict returned an event_id, fetch the event stream
+        if (json.event_id) {
+          const eventUrl = `${endpoint}/${json.event_id}`;
+          const eventRes = await fetch(eventUrl, { headers });
+          if (eventRes.ok) {
+            const eventText = await eventRes.text();
+            // Parse SSE data: ...
+            const lines = eventText.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data:')) {
+                try {
+                  const eventData = JSON.parse(line.replace(/^data:\s*/, ''));
+                  return { ok: true, data: { data: eventData } };
+                } catch (_) {}
+              }
+            }
+          }
+        }
+        return { ok: true, data: json };
+      }
+    } catch (_) {
+      // Try next endpoint candidate
+    }
+  }
+
+  return { ok: false };
 }
 
 export async function POST(req: NextRequest) {
@@ -52,7 +105,7 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
-    const { sentences, modelId: userModelId, hfToken: userHfToken } = body;
+    const { sentences, modelId: rawModelId, hfToken: userHfToken } = body;
 
     if (!sentences || !Array.isArray(sentences) || sentences.length === 0) {
       return NextResponse.json(
@@ -61,14 +114,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const modelId = userModelId?.trim() || process.env.NEXT_PUBLIC_DEFAULT_MODEL_ID?.trim();
-    if (!modelId) {
+    const rawId = rawModelId?.trim() || process.env.NEXT_PUBLIC_DEFAULT_MODEL_ID?.trim();
+    if (!rawId) {
       return NextResponse.json(
         { error: 'Model ID or Hugging Face Space URL is missing.' },
         { status: 400 }
       );
     }
 
+    const modelId = normalizeSpaceUrl(rawId);
     const hfToken = userHfToken?.trim() || process.env.HF_API_TOKEN?.trim() || '';
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -77,28 +131,13 @@ export async function POST(req: NextRequest) {
       headers['Authorization'] = `Bearer ${hfToken}`;
     }
 
-    let hfResponse: Response | null = null;
-    let lastNetworkError: any = null;
+    let parsedData: any = null;
 
-    // If it's a Hugging Face Space URL (e.g. https://himux-pubmed-rct-api.hf.space)
     if (modelId.startsWith('http://') || modelId.startsWith('https://')) {
-      const baseUrl = modelId.endsWith('/') ? modelId.slice(0, -1) : modelId;
-      
-      // Try 1: Gradio native /api/predict endpoint
-      try {
-        const textPayload = sentences.join('\n');
-        hfResponse = await queryEndpoint(`${baseUrl}/api/predict`, { data: [textPayload] }, headers);
-      } catch (e) {
-        lastNetworkError = e;
-      }
-
-      // Try 2: Direct /predict endpoint if /api/predict failed
-      if (!hfResponse || !hfResponse.ok) {
-        try {
-          hfResponse = await queryEndpoint(`${baseUrl}/predict`, { sentences, inputs: sentences }, headers);
-        } catch (e) {
-          lastNetworkError = e;
-        }
+      const textPayload = sentences.join('\n');
+      const gradioRes = await callGradioApi(modelId, textPayload, headers);
+      if (gradioRes.ok) {
+        parsedData = gradioRes.data;
       }
     } else {
       // Direct HF Hub Model ID
@@ -109,45 +148,40 @@ export async function POST(req: NextRequest) {
       };
 
       const candidateEndpoints = [
-        `https://api-inference.huggingface.co/models/${modelId}`,
         `https://router.huggingface.co/hf-inference/models/${modelId}`,
+        `https://api-inference.huggingface.co/models/${modelId}`,
       ];
 
       for (const endpoint of candidateEndpoints) {
         try {
-          hfResponse = await queryEndpoint(endpoint, requestPayload, headers);
-          if (hfResponse && hfResponse.ok) break;
-        } catch (err: any) {
-          lastNetworkError = err;
-        }
+          const res = await fetch(endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(requestPayload),
+          });
+          if (res.ok) {
+            parsedData = await res.json();
+            break;
+          }
+        } catch (_) {}
       }
     }
 
-    if (!hfResponse) {
+    if (!parsedData) {
       return NextResponse.json(
         {
-          error: `Could not connect to Space/API (${lastNetworkError?.message || 'Connection refused'}). Please verify your Space URL is running.`,
+          error: `Could not connect to model at "${modelId}". Please verify your Space is Running and public.`,
         },
         { status: 502 }
       );
     }
 
     const latencyMs = Date.now() - startTime;
-
-    if (!hfResponse.ok) {
-      const errorText = await hfResponse.text();
-      return NextResponse.json(
-        { error: `Backend API error (${hfResponse.status}): ${errorText}` },
-        { status: hfResponse.status }
-      );
-    }
-
-    const data = await hfResponse.json();
     let sentenceResults: SentencePrediction[] = [];
 
-    // Format A: Gradio response { data: [ [ { sentenceNumber, ... } ] ] } or { data: [ [...] ] }
-    if (data.data && Array.isArray(data.data)) {
-      const payload = data.data[0];
+    // Parse Gradio data format
+    if (parsedData.data && Array.isArray(parsedData.data)) {
+      const payload = parsedData.data[0];
       if (Array.isArray(payload)) {
         sentenceResults = payload.map((item: any, idx: number) => ({
           sentenceNumber: idx + 1,
@@ -158,21 +192,19 @@ export async function POST(req: NextRequest) {
           allScores: item.allScores || [],
         }));
       }
-    } else if (data.results && Array.isArray(data.results)) {
-      // Format B: FastAPI custom response { results: [...] }
-      sentenceResults = data.results.map((item: any, idx: number) => ({
+    } else if (parsedData.results && Array.isArray(parsedData.results)) {
+      sentenceResults = parsedData.results.map((item: any, idx: number) => ({
         sentenceNumber: idx + 1,
-        totalSentences: data.results.length,
+        totalSentences: parsedData.results.length,
         text: item.text || sentences[idx] || '',
         predictedLabel: normalizeLabel(item.predictedLabel || item.label || 'UNKNOWN'),
         confidence: typeof item.confidence === 'number' ? item.confidence : (item.score || 1.0),
         allScores: item.allScores || [],
       }));
-    } else if (Array.isArray(data)) {
-      // Format C: Standard HF Inference API
-      if (Array.isArray(data[0])) {
+    } else if (Array.isArray(parsedData)) {
+      if (Array.isArray(parsedData[0])) {
         sentenceResults = sentences.map((text, idx) => {
-          const scoresArray = (data[idx] || []) as Array<{ label: string; score: number }>;
+          const scoresArray = (parsedData[idx] || []) as Array<{ label: string; score: number }>;
           const sortedScores: LabelScore[] = scoresArray
             .map((s) => ({ label: normalizeLabel(s.label), score: s.score }))
             .sort((a, b) => b.score - a.score);
@@ -192,7 +224,7 @@ export async function POST(req: NextRequest) {
 
     if (sentenceResults.length === 0) {
       return NextResponse.json(
-        { error: 'Unexpected response format from Space.', raw: data },
+        { error: 'Unexpected response format from backend.', raw: parsedData },
         { status: 502 }
       );
     }
